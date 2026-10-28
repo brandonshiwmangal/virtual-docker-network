@@ -1,0 +1,11 @@
+# Docker build artifacts
+**/__pycache__/
+*.pyc
+
+# Python venvs
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db

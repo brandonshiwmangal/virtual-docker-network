@@ -1,0 +1,196 @@
+# ============================================================
+#  Virtual Docker Network
+#  Topology:
+#    netops01 ─────────────────────────────────────────────┐
+#    fw01 ── mgmt_net(172.20.0.0/24) ── rt01               │
+#    fw01 ── lan_net(10.10.10.0/24)   [VLAN10 / SVI10]     │
+#    fw01 ── dmz_net(10.10.20.0/24)   [VLAN20 / SVI20]     │
+#    fw01 ── transit_net(10.10.30.0/24) ── rt01            │
+#    fw01 ── ospf_backbone(10.10.40.0/24) ── rt01          │
+#  OSPFv3 adjacency on ospf_backbone; IPv6 (fd00:1::/64)   │
+#  assigned in entrypoints.  Gateways set to .254 so       │
+#  containers can use .1/.2 without conflicting with        │
+#  Docker's bridge address.                                 │
+# ============================================================
+
+networks:
+  mgmt_net:
+    name: vdn_mgmt
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.254
+
+  lan_net:
+    name: vdn_lan
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.10.10.0/24
+          gateway: 10.10.10.254
+
+  dmz_net:
+    name: vdn_dmz
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.10.20.0/24
+          gateway: 10.10.20.254
+
+  transit_net:
+    name: vdn_transit
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.10.30.0/24
+          gateway: 10.10.30.254
+
+  ospf_backbone:
+    name: vdn_ospf
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.10.40.0/24
+          gateway: 10.10.40.254
+
+services:
+
+  # ----------------------------------------------------------
+  #  FIREWALL MANAGER (fw01)
+  #  - Zone-based iptables firewall (MGMT / LAN / DMZ / TRANSIT)
+  #  - ISC DHCP server  (LAN pool: .100-.200, DMZ pool: .100-.200)
+  #  - SVIs: vlan10 (10.10.10.1) and vlan20 (10.10.20.1)
+  #  - FRR OSPFv3 (router-id 2.2.2.2, area 0, fd00:1::1/64)
+  # ----------------------------------------------------------
+  firewall:
+    build:
+      context: ./firewall
+    container_name: fw01
+    hostname: fw01
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.forwarding: "1"
+      net.ipv4.conf.all.send_redirects: "0"
+      net.ipv4.conf.all.accept_redirects: "0"
+    networks:
+      mgmt_net:
+        ipv4_address: 172.20.0.2
+      lan_net:
+        ipv4_address: 10.10.10.1
+      dmz_net:
+        ipv4_address: 10.10.20.1
+      transit_net:
+        ipv4_address: 10.10.30.1
+      ospf_backbone:
+        ipv4_address: 10.10.40.1
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  #  ROUTER (rt01)
+  #  - FRR OSPFv3 (router-id 1.1.1.1, area 0, fd00:1::2/64)
+  #  - Redistributes connected routes into OSPFv3
+  #  - Default route: 10.10.30.1 (firewall transit)
+  # ----------------------------------------------------------
+  router:
+    build:
+      context: ./router
+    container_name: rt01
+    hostname: rt01
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.forwarding: "1"
+      net.ipv6.conf.all.accept_ra: "0"
+    networks:
+      mgmt_net:
+        ipv4_address: 172.20.0.3
+      transit_net:
+        ipv4_address: 10.10.30.2
+      ospf_backbone:
+        ipv4_address: 10.10.40.2
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  #  NETWORK OPERATIONS MANAGER (netops01)
+  #  - Connectivity checks (ping sweep)
+  #  - OSPFv3 neighbor / route verification via Docker API
+  #  - DHCP lease inspection
+  #  - Firewall rule audit
+  #  - Continuous topology report (every 60 s)
+  # ----------------------------------------------------------
+  netops:
+    build:
+      context: ./netops
+    container_name: netops01
+    hostname: netops01
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      mgmt_net:
+        ipv4_address: 172.20.0.10
+    depends_on:
+      - firewall
+      - router
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  #  DHCP CLIENT – LAN (client-lan)
+  #  Gets address from fw01 DHCP pool: 10.10.10.100-200
+  # ----------------------------------------------------------
+  client_lan:
+    image: alpine:latest
+    container_name: client-lan
+    hostname: client-lan
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - lan_net
+    command: >
+      sh -c "echo 'Requesting DHCP on LAN...' &&
+             udhcpc -i eth0 -n -q -v 2>&1 &&
+             echo '=== client-lan IP ===' &&
+             ip addr show eth0 &&
+             sleep infinity"
+    depends_on:
+      - firewall
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  #  DHCP CLIENT – DMZ (client-dmz)
+  #  Gets address from fw01 DHCP pool: 10.10.20.100-200
+  # ----------------------------------------------------------
+  client_dmz:
+    image: alpine:latest
+    container_name: client-dmz
+    hostname: client-dmz
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - dmz_net
+    command: >
+      sh -c "echo 'Requesting DHCP on DMZ...' &&
+             udhcpc -i eth0 -n -q -v 2>&1 &&
+             echo '=== client-dmz IP ===' &&
+             ip addr show eth0 &&
+             sleep infinity"
+    depends_on:
+      - firewall
+    restart: unless-stopped
