@@ -1,16 +1,19 @@
 # ============================================================
 #  Virtual Docker Network
 #  Topology:
-#    netops01 ─────────────────────────────────────────────┐
-#    fw01 ── mgmt_net(172.20.0.0/24) ── rt01               │
-#    fw01 ── lan_net(10.10.10.0/24)   [VLAN10 / SVI10]     │
-#    fw01 ── dmz_net(10.10.20.0/24)   [VLAN20 / SVI20]     │
-#    fw01 ── transit_net(10.10.30.0/24) ── rt01            │
-#    fw01 ── ospf_backbone(10.10.40.0/24) ── rt01          │
-#  OSPFv3 adjacency on ospf_backbone; IPv6 (fd00:1::/64)   │
-#  assigned in entrypoints.  Gateways set to .254 so       │
-#  containers can use .1/.2 without conflicting with        │
-#  Docker's bridge address.                                 │
+#    netops01 -- mgmt_net(172.20.0.0/24) -- fw01, rt01
+#    fw01 -- lan_net(10.10.10.0/24)       [VLAN10 / SVI10]
+#    fw01 -- dmz_net(10.10.20.0/24)       [VLAN20 / SVI20]
+#    fw01 -- transit_net(10.10.30.0/24)   -- rt01
+#    fw01 -- ospf_backbone(10.10.40.0/24) -- rt01
+#    fw01 -- t2r_trunk(10.10.224.0/29)    -- SnakeT2R      (FIX: new)
+#              VLAN 224 inside: 192.168.1.112/29
+#              fw01 .114  <-- OSPFv2 area 0 MD5 + PIM -->  SnakeT2R .113
+#  OSPFv3 adjacency on ospf_backbone; IPv6 (fd00:1::/64)
+#  assigned in entrypoints. Gateways set to the top host address
+#  so containers can use .1/.2 without conflicting with Docker's
+#  bridge address.
+#  Lines marked  # FIX:  were added or changed.
 # ============================================================
 
 networks:
@@ -59,14 +62,28 @@ networks:
         - subnet: 10.10.40.0/24
           gateway: 10.10.40.254
 
+  # FIX: trunk to SnakeT2R Gi2. The Docker subnet only addresses the
+  # parent interfaces; the real link (192.168.1.112/29) rides VLAN 224
+  # on top, so the Cisco config keeps "encapsulation dot1Q 224" and
+  # there is no IP clash between the container and the router VM.
+  t2r_trunk:
+    name: vdn_t2r
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.10.224.0/29
+          gateway: 10.10.224.6
+
 services:
 
   # ----------------------------------------------------------
   #  FIREWALL MANAGER (fw01)
-  #  - Zone-based iptables firewall (MGMT / LAN / DMZ / TRANSIT)
+  #  - Zone-based iptables firewall (MGMT / LAN / DMZ / TRANSIT / T2R)
   #  - ISC DHCP server  (LAN pool: .100-.200, DMZ pool: .100-.200)
   #  - SVIs: vlan10 (10.10.10.1) and vlan20 (10.10.20.1)
   #  - FRR OSPFv3 (router-id 2.2.2.2, area 0, fd00:1::1/64)
+  #  - FRR OSPFv2 + PIM to SnakeT2R on t2r (VLAN 224, .114/29)
   # ----------------------------------------------------------
   firewall:
     build:
@@ -78,11 +95,16 @@ services:
       - NET_ADMIN
       - NET_RAW
       - SYS_ADMIN
+    environment:                          # FIX: read by entrypoint.sh step 4b
+      T2R_PARENT_IP: "10.10.224.2"
+      T2R_VLAN: "224"
     sysctls:
       net.ipv4.ip_forward: "1"
       net.ipv6.conf.all.forwarding: "1"
       net.ipv4.conf.all.send_redirects: "0"
       net.ipv4.conf.all.accept_redirects: "0"
+      net.ipv4.conf.all.rp_filter: "0"      # FIX: pimd does its own RPF check
+      net.ipv4.conf.default.rp_filter: "0"  # FIX: covers the t2r VLAN made later
     networks:
       mgmt_net:
         ipv4_address: 172.20.0.2
@@ -94,6 +116,14 @@ services:
         ipv4_address: 10.10.30.1
       ospf_backbone:
         ipv4_address: 10.10.40.1
+      t2r_trunk:                          # FIX: parent of the VLAN 224 link
+        ipv4_address: 10.10.224.2
+    healthcheck:                          # FIX: lets clients wait for DHCP
+      test: ["CMD-SHELL", "test -s /run/dhcpd.pid && kill -0 $$(cat /run/dhcpd.pid)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
     restart: unless-stopped
 
   # ----------------------------------------------------------
@@ -126,6 +156,25 @@ services:
     restart: unless-stopped
 
   # ----------------------------------------------------------
+  #  CISCO ROUTER (SnakeT2R) - OPTIONAL, needs a vrnetlab-style
+  #  image that wraps the IOS-XE (C8000v/CSR1000v) VM. Fill in the
+  #  image name you built and uncomment. Check your image's docs for
+  #  which container interface maps to Gi2 (usually eth1 when eth0
+  #  is the management port).
+  # ----------------------------------------------------------
+  # snaket2r:
+  #   image: <<YOUR_VRNETLAB_C8000V_IMAGE>>
+  #   container_name: snaket2r
+  #   hostname: SnakeT2R
+  #   privileged: true
+  #   networks:
+  #     mgmt_net:
+  #       ipv4_address: 172.20.0.20
+  #     t2r_trunk:
+  #       ipv4_address: 10.10.224.3
+  #   restart: unless-stopped
+
+  # ----------------------------------------------------------
   #  NETWORK OPERATIONS MANAGER (netops01)
   #  - Connectivity checks (ping sweep)
   #  - OSPFv3 neighbor / route verification via Docker API
@@ -142,6 +191,8 @@ services:
       - NET_ADMIN
       - NET_RAW
     volumes:
+      # Docker socket = root on the host. Fine for a lab; keep it off anything real.
+      # (":ro" would NOT help - it does not restrict API calls over the socket)
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       mgmt_net:
@@ -152,7 +203,7 @@ services:
     restart: unless-stopped
 
   # ----------------------------------------------------------
-  #  DHCP CLIENT – LAN (client-lan)
+  #  DHCP CLIENT - LAN (client-lan)
   #  Gets address from fw01 DHCP pool: 10.10.10.100-200
   # ----------------------------------------------------------
   client_lan:
@@ -163,18 +214,26 @@ services:
       - NET_ADMIN
     networks:
       - lan_net
+    # FIX: wait for dhcpd, retry instead of crash-looping, drop the
+    #      Docker-assigned IP/route (it points at 10.10.10.254 and
+    #      bypasses fw01), and stay running so the lease renews.
     command: >
-      sh -c "echo 'Requesting DHCP on LAN...' &&
-             udhcpc -i eth0 -n -q -v 2>&1 &&
-             echo '=== client-lan IP ===' &&
-             ip addr show eth0 &&
+      sh -c "echo 'Requesting DHCP on LAN...';
+             ip addr flush dev eth0;
+             ip route flush dev eth0;
+             udhcpc -i eth0 -t 10 -T 3 -A 5 -b -v 2>&1;
+             sleep 2;
+             echo '=== client-lan IP ===';
+             ip addr show eth0;
+             ip route;
              sleep infinity"
     depends_on:
-      - firewall
+      firewall:
+        condition: service_healthy
     restart: unless-stopped
 
   # ----------------------------------------------------------
-  #  DHCP CLIENT – DMZ (client-dmz)
+  #  DHCP CLIENT - DMZ (client-dmz)
   #  Gets address from fw01 DHCP pool: 10.10.20.100-200
   # ----------------------------------------------------------
   client_dmz:
@@ -186,11 +245,16 @@ services:
     networks:
       - dmz_net
     command: >
-      sh -c "echo 'Requesting DHCP on DMZ...' &&
-             udhcpc -i eth0 -n -q -v 2>&1 &&
-             echo '=== client-dmz IP ===' &&
-             ip addr show eth0 &&
+      sh -c "echo 'Requesting DHCP on DMZ...';
+             ip addr flush dev eth0;
+             ip route flush dev eth0;
+             udhcpc -i eth0 -t 10 -T 3 -A 5 -b -v 2>&1;
+             sleep 2;
+             echo '=== client-dmz IP ===';
+             ip addr show eth0;
+             ip route;
              sleep infinity"
     depends_on:
-      - firewall
+      firewall:
+        condition: service_healthy
     restart: unless-stopped
