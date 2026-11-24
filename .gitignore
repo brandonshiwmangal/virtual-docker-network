@@ -1,10 +1,40 @@
-# Docker build artifacts
+# Python build artifacts
 **/__pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
 
 # Python venvs
 venv/
 .venv/
+
+# Secrets - keep real keys out of git (OSPF MD5, RADIUS, SNMPv3, etc.)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# Local Docker Compose overrides
+docker-compose.override.yml
+compose.override.yml
+
+# Cisco / vrnetlab VM images - large and licensed, never commit
+*.qcow2
+*.vmdk
+*.iso
+*.bin
+
+# Runtime output from the containers
+*.log
+*.leases
+*.leases~
+*.pid
+
+# Editors
+.vscode/
+.idea/
+*.swp
 
 # OS
 .DS_Store
