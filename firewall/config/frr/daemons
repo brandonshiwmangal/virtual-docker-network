@@ -1,11 +1,13 @@
 zebra=yes
 bgpd=no
-ospfd=no
+# FIX: OSPFv2 to SnakeT2R
+ospfd=yes
 ospf6d=yes
 ripd=no
 ripngd=no
 isisd=no
-pimd=no
+# FIX: PIM-SM toward the router's RP
+pimd=yes
 ldpd=no
 nhrpd=no
 eigrpd=no
@@ -20,5 +22,7 @@ staticd=yes
 
 vtysh_enable=yes
 zebra_options="  -A 127.0.0.1 -s 90000000"
+ospfd_options=" -A 127.0.0.1"
 ospf6d_options=" -A ::1"
+pimd_options=" -A 127.0.0.1"
 staticd_options="-A 127.0.0.1"
